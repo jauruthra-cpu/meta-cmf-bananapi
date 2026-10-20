@@ -1,0 +1,222 @@
+--- a/rdkb_hal/src/ethsw/ccsp_hal_ethsw.c
++++ b/rdkb_hal/src/ethsw/ccsp_hal_ethsw.c
+@@ -1279,3 +1279,219 @@
+     snprintf(Interface, maxSize, "%s", ETH_WAN_IFNAME);
+     return RETURN_OK;
+ }
++
++#include <fcntl.h>
++
++#define ETHSW_SYSFS_STATS_PATH       "/sys/class/net/%s/statistics/"
++
++#ifndef ETHSW_LAN_IFNAME_PREFIX
++#define ETHSW_LAN_IFNAME_PREFIX      "lan"
++#endif
++
++#ifdef THREE_GMACS_SUPPORT
++#ifndef ETHSW_EXT_GMAC_PORT_ID
++#define ETHSW_EXT_GMAC_PORT_ID       5
++#endif
++#ifndef ETHSW_EXT_GMAC_IFNAME
++#define ETHSW_EXT_GMAC_IFNAME        "eth3"
++#endif
++#endif
++
++/* Callback registered by the upper layer for Ethernet client association/disassociation events */
++static CcspHalExtSw_ethAssociatedDevice_callback g_ethAssociatedDeviceCallback = NULL;
++
++/* Maps a network interface statistics counter to the CCSP_HAL_ETH_STATS member that receives its value */
++typedef struct _ETHSW_STAT_ENTRY
++{
++    const CHAR *name;
++    ULONG      *pValue;
++} ETHSW_STAT_ENTRY;
++
++/* CcspHalExtSw_ethAssociatedDevice_callback_register :  */
++/**
++* @description Registers a callback function for Ethernet client association/disassociation events.
++*
++* @param callback_proc -- Callback function to be registered. NULL unregisters the existing callback.
++*
++* @return None.
++*
++* @execution Synchronous.
++* @sideeffect None.
++*/
++
++void CcspHalExtSw_ethAssociatedDevice_callback_register(CcspHalExtSw_ethAssociatedDevice_callback callback_proc)
++{
++    g_ethAssociatedDeviceCallback = callback_proc;
++}
++
++/* ethsw_get_port_ifname :  */
++/**
++* @description Maps an Ethernet switch port ID to its network interface name.
++*
++* @param PortId     -- Port ID as defined in CCSP_HAL_ETHSW_PORT
++* @param ifName     -- Buffer that receives the interface name
++* @param ifNameSize -- Size of the ifName buffer
++*
++* @return The status of the operation.
++* @retval RETURN_OK if successful.
++* @retval RETURN_ERR if any error is detected
++*/
++
++static INT ethsw_get_port_ifname(CCSP_HAL_ETHSW_PORT PortId, CHAR *ifName, size_t ifNameSize)
++{
++    INT len = 0;
++
++    if ((INT)PortId < 1)
++    {
++        return RETURN_ERR;
++    }
++
++#ifdef THREE_GMACS_SUPPORT
++    if ((INT)PortId == ETHSW_EXT_GMAC_PORT_ID)
++    {
++        len = snprintf(ifName, ifNameSize, "%s", ETHSW_EXT_GMAC_IFNAME);
++    }
++    else
++#endif
++    if ((INT)PortId == 1)
++    {
++        len = snprintf(ifName, ifNameSize, "%s", g_virtualIfName);
++    }
++    else
++    {
++        len = snprintf(ifName, ifNameSize, ETHSW_LAN_IFNAME_PREFIX "%d", ((INT)PortId - 1));
++    }
++
++    if (len < 0 || (size_t)len >= ifNameSize)
++    {
++        return RETURN_ERR;
++    }
++
++    return RETURN_OK;
++}
++
++/* ethsw_read_if_stat :  */
++/**
++* @description Reads a single statistics counter of a network interface.
++*
++* @param path     -- Buffer holding the statistics directory path, the counter name is appended to it
++* @param pathSize -- Size of the path buffer
++* @param dirLen   -- Length of the statistics directory path already present in the path buffer
++* @param statName -- Name of the statistics counter, for example "tx_bytes"
++* @param pValue   -- Receives the counter value
++*
++* @return The status of the operation.
++* @retval RETURN_OK if successful.
++* @retval RETURN_ERR if any error is detected
++*/
++
++static INT ethsw_read_if_stat(CHAR *path, size_t pathSize, size_t dirLen, const CHAR *statName, ULLONG *pValue)
++{
++    CHAR buf[32] = {0};
++    CHAR *end = NULL;
++    ssize_t count = 0;
++    INT len = 0;
++    INT fd = -1;
++
++    len = snprintf(path + dirLen, pathSize - dirLen, "%s", statName);
++    if (len < 0 || (size_t)len >= (pathSize - dirLen))
++    {
++        return RETURN_ERR;
++    }
++
++    fd = open(path, O_RDONLY);
++    if (fd < 0)
++    {
++        return RETURN_ERR;
++    }
++
++    count = read(fd, buf, sizeof(buf) - 1);
++    close(fd);
++
++    if (count <= 0)
++    {
++        return RETURN_ERR;
++    }
++
++    buf[count] = '\0';
++    *pValue = (ULLONG)strtoull(buf, &end, 10);
++
++    return (end == buf) ? RETURN_ERR : RETURN_OK;
++}
++
++/* CcspHalEthSwGetEthPortStats :  */
++/**
++* @description Retrieves the statistics of the specified Ethernet switch port.
++*
++* @param PortId -- Port ID as defined in CCSP_HAL_ETHSW_PORT
++* @param pStats -- Receives the port statistics, as in CCSP_HAL_ETH_STATS
++*
++* @return The status of the operation.
++* @retval RETURN_OK if successful.
++* @retval RETURN_ERR if any error is detected
++*
++* @execution Synchronous.
++* @sideeffect None.
++*
++* @note Counters that are not provided by the network interface statistics are reported as 0.
++*/
++
++INT CcspHalEthSwGetEthPortStats(CCSP_HAL_ETHSW_PORT PortId, PCCSP_HAL_ETH_STATS pStats)
++{
++    CHAR ifName[32] = {0};
++    CHAR path[128] = {0};
++    CCSP_HAL_ETH_STATS stats;
++    ETHSW_STAT_ENTRY statTable[] =
++    {
++        { "tx_packets", &stats.PacketsSent },
++        { "rx_packets", &stats.PacketsReceived },
++        { "tx_errors",  &stats.ErrorsSent },
++        { "rx_errors",  &stats.ErrorsReceived },
++        { "tx_dropped", &stats.DiscardPacketsSent },
++        { "rx_dropped", &stats.DiscardPacketsReceived },
++        { "multicast",  &stats.MulticastPacketsReceived }
++    };
++    ULLONG value = 0;
++    size_t dirLen = 0;
++    size_t i = 0;
++    INT len = 0;
++
++    if (pStats == NULL)
++    {
++        return RETURN_ERR;
++    }
++
++    if (ethsw_get_port_ifname(PortId, ifName, sizeof(ifName)) != RETURN_OK)
++    {
++        CcspHalEthSwTrace(("Invalid port id %d\n", (INT)PortId));
++        return RETURN_ERR;
++    }
++
++    len = snprintf(path, sizeof(path), ETHSW_SYSFS_STATS_PATH, ifName);
++    if (len < 0 || (size_t)len >= sizeof(path))
++    {
++        return RETURN_ERR;
++    }
++    dirLen = (size_t)len;
++
++    memset(&stats, 0, sizeof(stats));
++
++    if (ethsw_read_if_stat(path, sizeof(path), dirLen, "tx_bytes", &stats.BytesSent) != RETURN_OK ||
++        ethsw_read_if_stat(path, sizeof(path), dirLen, "rx_bytes", &stats.BytesReceived) != RETURN_OK)
++    {
++        CcspHalEthSwTrace(("Unable to read statistics of port id %d (%s)\n", (INT)PortId, ifName));
++        return RETURN_ERR;
++    }
++
++    for (i = 0; i < (sizeof(statTable) / sizeof(statTable[0])); i++)
++    {
++        if (ethsw_read_if_stat(path, sizeof(path), dirLen, statTable[i].name, &value) == RETURN_OK)
++        {
++            *statTable[i].pValue = (ULONG)value;
++        }
++    }
++
++    *pStats = stats;
++
++    return RETURN_OK;
++}
